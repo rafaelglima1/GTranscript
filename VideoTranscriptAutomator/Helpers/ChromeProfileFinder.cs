@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace VideoTranscriptAutomator.Helpers;
 
@@ -74,36 +75,13 @@ public static class ChromeProfileFinder
             return;
         }
 
+        var escapedPath = profilePath.Replace("\\", "\\\\");
         var json = File.ReadAllText(settingsPath);
-        using var doc = JsonDocument.Parse(json);
-        var root = doc.RootElement.Clone();
+        var updated = Regex.Replace(json,
+            @"(""ChromeUserDataPath""\s*:\s*"")[^""]*("")",
+            $"$1{escapedPath}$2");
 
-        var appSettings = root.GetProperty("AppSettings").Clone();
-        var mutable = new Dictionary<string, object>();
-
-        foreach (var prop in appSettings.EnumerateObject())
-        {
-            if (prop.Name == "ChromeUserDataPath")
-                mutable["ChromeUserDataPath"] = profilePath;
-            else if (prop.Value.ValueKind == JsonValueKind.String)
-                mutable[prop.Name] = prop.Value.GetString() ?? "";
-            else if (prop.Value.ValueKind == JsonValueKind.Array)
-                mutable[prop.Name] = prop.Value.EnumerateArray()
-                    .Select(x => x.GetString() ?? "").ToArray();
-            else
-                mutable[prop.Name] = prop.Value.ToString();
-        }
-
-        var options = new JsonSerializerOptions { WriteIndented = true };
-        var newAppSettings = JsonSerializer.Serialize(mutable, options);
-
-        var fullJson = $$"""
-        {
-          "AppSettings": {{newAppSettings}}
-        }
-        """;
-
-        File.WriteAllText(settingsPath, fullJson);
+        File.WriteAllText(settingsPath, updated);
         Console.WriteLine($"[OK] ChromeUserDataPath saved to {settingsPath}");
     }
 
