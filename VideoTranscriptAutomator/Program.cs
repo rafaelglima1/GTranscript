@@ -6,6 +6,7 @@ using Polly;
 using Polly.Retry;
 using Polly.Timeout;
 using VideoTranscriptAutomator.Config;
+using VideoTranscriptAutomator.Helpers;
 using VideoTranscriptAutomator.Interfaces;
 using VideoTranscriptAutomator.Services;
 
@@ -15,6 +16,32 @@ public class Program
 {
     public static async Task Main(string[] args)
     {
+        if (args.Contains("--list-profiles"))
+        {
+            ChromeProfileFinder.ListProfiles();
+            return;
+        }
+
+        var configBuilder = new ConfigurationBuilder()
+            .SetBasePath(AppContext.BaseDirectory)
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+            .AddJsonFile($"appsettings.{Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Production"}.json", optional: true)
+            .AddEnvironmentVariables();
+
+        var tempConfig = configBuilder.Build();
+        var tempSettings = new AppSettings();
+        tempConfig.GetSection("AppSettings").Bind(tempSettings);
+
+        if (string.IsNullOrWhiteSpace(tempSettings.ChromeUserDataPath))
+        {
+            var selectedPath = ChromeProfileFinder.PromptForProfile();
+            if (selectedPath is not null)
+            {
+                ChromeProfileFinder.SaveProfileToSettings(selectedPath);
+                tempSettings.ChromeUserDataPath = selectedPath;
+            }
+        }
+
         var host = Host.CreateDefaultBuilder(args)
             .ConfigureAppConfiguration((context, config) =>
             {
