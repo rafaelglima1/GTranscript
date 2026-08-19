@@ -1,21 +1,26 @@
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using VideoTranscriptAutomator.Config;
 using VideoTranscriptAutomator.Interfaces;
 
 namespace VideoTranscriptAutomator.Services;
 
 public class VideoProcessor : IVideoProcessor
 {
-    private readonly IGoogleDriveService _googleDriveService;
+    private readonly IUiAutomationService _uiService;
     private readonly ITranscriptionService _transcriptionService;
+    private readonly AppSettings _settings;
     private readonly ILogger<VideoProcessor> _logger;
 
     public VideoProcessor(
-        IGoogleDriveService googleDriveService,
+        IUiAutomationService uiService,
         ITranscriptionService transcriptionService,
+        IOptions<AppSettings> settings,
         ILogger<VideoProcessor> logger)
     {
-        _googleDriveService = googleDriveService;
+        _uiService = uiService;
         _transcriptionService = transcriptionService;
+        _settings = settings.Value;
         _logger = logger;
     }
 
@@ -23,7 +28,7 @@ public class VideoProcessor : IVideoProcessor
     {
         _logger.LogInformation("[PROCESS] Scanning folder: {FolderId}", folderId);
 
-        var videos = await _googleDriveService.ListVideosInFolderAsync(folderId, cancellationToken);
+        var videos = await _uiService.ListFilesInFolderAsync(folderId, cancellationToken);
 
         if (videos.Count == 0)
         {
@@ -34,42 +39,45 @@ public class VideoProcessor : IVideoProcessor
         foreach (var video in videos)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await ProcessFileAsync(video, cancellationToken);
+            await ProcessFileAsync(folderId, video, cancellationToken);
         }
     }
 
-    private async Task ProcessFileAsync(Google.Apis.Drive.v3.Data.File video, CancellationToken cancellationToken)
+    private async Task ProcessFileAsync(string folderId, DriveFileInfo video, CancellationToken cancellationToken)
     {
-        var videoName = video.Name ?? "unknown";
-        var txtName = Path.ChangeExtension(videoName, ".txt");
+        var txtName = Path.ChangeExtension(video.Name, ".txt");
 
-        var txtExists = await _googleDriveService.FileExistsInFolderAsync(
-            video.Parents?.First() ?? string.Empty,
-            txtName,
-            cancellationToken);
-
+        var txtExists = await _uiService.FileExistsInFolderAsync(folderId, txtName, cancellationToken);
         if (txtExists)
         {
             _logger.LogWarning("[SKIPPED] Transcription already exists: {TxtName}", txtName);
             return;
         }
 
-        _logger.LogInformation("[START] Transcribing: {VideoName} (ID: {FileId})", videoName, video.Id);
+        _logger.LogInformation("[START] Transcribing: {VideoName}", video.Name);
 
+        string? downloadedPath = null;
         try
         {
-            using var stream = await _googleDriveService.DownloadFileStreamAsync(video.Id!, cancellationToken);
-            var result = await _transcriptionService.TranscribeAsync(stream, videoName, cancellationToken);
+            downloadedPath = await _uiService.DownloadFileAsync(folderId, video.Name, cancellationToken);
+
+            await using var fileStream = File.OpenRead(downloadedPath);
+            var result = await _transcriptionService.TranscribeAsync(fileStream, video.Name, cancellationToken);
 
             if (result.Success)
             {
-                var folderId = video.Parents?.First() ?? string.Empty;
-                await _googleDriveService.UploadTextFileAsync(folderId, txtName, result.Transcription, cancellationToken);
-                _logger.LogInformation("[SUCCESS] Uploaded: {TxtName}", txtName);
+                var txtPath = Path.Combine(_settings.DownloadDirectory, txtName);
+                await File.WriteAllTextAsync(txtPath, result.Transcription, cancellationToken);
+                _logger.LogInformation("[SUCCESS] Written locally: {TxtPath}", txtPath);
+
+                await _uiService.UploadFileAsync(folderId, txtPath, cancellationToken);
+                _logger.LogInformation("[SUCCESS] Uploaded to Drive: {TxtName}", txtName);
+
+                try { File.Delete(txtPath); } catch { /* best effort cleanup */ }
             }
             else
             {
-                _logger.LogError("[ERROR] {VideoName}: {Message}", videoName, result.Message);
+                _logger.LogError("[ERROR] {VideoName}: {Message}", video.Name, result.Message);
             }
         }
         catch (OperationCanceledException)
@@ -78,7 +86,14 @@ public class VideoProcessor : IVideoProcessor
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "[ERROR] Failed to process {VideoName}", videoName);
+            _logger.LogError(ex, "[ERROR] Failed to process {VideoName}", video.Name);
+        }
+        finally
+        {
+            if (downloadedPath is not null)
+            {
+                try { File.Delete(downloadedPath); } catch { /* best effort cleanup */ }
+            }
         }
     }
 }

@@ -59,7 +59,7 @@ public class Program
                         .Build();
                 });
 
-                services.AddSingleton<IGoogleDriveService, GoogleDriveService>();
+                services.AddSingleton<IUiAutomationService, PlaywrightAutomationService>();
 
                 services.AddHttpClient<ITranscriptionService, TranscriptionService>(client =>
                 {
