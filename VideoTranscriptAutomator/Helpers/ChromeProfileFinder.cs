@@ -82,7 +82,13 @@ public static class ChromeProfileFinder
             $"$1{escapedPath}$2");
 
         File.WriteAllText(settingsPath, updated);
-        Console.WriteLine($"[OK] ChromeUserDataPath saved to {settingsPath}");
+        Console.WriteLine($"[OK] ChromeUserDataPath saved to: {settingsPath}");
+
+        var binCopy = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+        if (File.Exists(binCopy) && binCopy != settingsPath)
+        {
+            File.WriteAllText(binCopy, updated);
+        }
     }
 
     private static string? FindProjectSettingsPath()

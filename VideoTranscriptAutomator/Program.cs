@@ -22,25 +22,7 @@ public class Program
             return;
         }
 
-        var configBuilder = new ConfigurationBuilder()
-            .SetBasePath(AppContext.BaseDirectory)
-            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-            .AddJsonFile($"appsettings.{Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Production"}.json", optional: true)
-            .AddEnvironmentVariables();
-
-        var tempConfig = configBuilder.Build();
-        var tempSettings = new AppSettings();
-        tempConfig.GetSection("AppSettings").Bind(tempSettings);
-
-        if (string.IsNullOrWhiteSpace(tempSettings.ChromeUserDataPath))
-        {
-            var selectedPath = ChromeProfileFinder.PromptForProfile();
-            if (selectedPath is not null)
-            {
-                ChromeProfileFinder.SaveProfileToSettings(selectedPath);
-                tempSettings.ChromeUserDataPath = selectedPath;
-            }
-        }
+        var selectedChromePath = ResolveChromeProfile();
 
         var host = Host.CreateDefaultBuilder(args)
             .ConfigureAppConfiguration((context, config) =>
@@ -59,6 +41,9 @@ public class Program
                     var llmApiKey = Environment.GetEnvironmentVariable("LLM_API_KEY");
                     if (!string.IsNullOrEmpty(llmApiKey))
                         options.ApiKey = llmApiKey;
+
+                    if (!string.IsNullOrWhiteSpace(selectedChromePath))
+                        options.ChromeUserDataPath = selectedChromePath;
                 });
 
                 services.AddSingleton<ResiliencePipeline>(sp =>
@@ -109,6 +94,7 @@ public class Program
 
         var settings = host.Services
             .GetRequiredService<Microsoft.Extensions.Options.IOptions<AppSettings>>().Value;
+        logger.LogInformation("Chrome profile: {Profile}", settings.ChromeUserDataPath);
         logger.LogInformation("Configured Google Drive folders: {Folders}",
             string.Join(", ", settings.GoogleDriveFolderIds));
 
@@ -130,5 +116,28 @@ public class Program
         }
 
         logger.LogInformation("VideoTranscriptAutomator finished.");
+    }
+
+    private static string? ResolveChromeProfile()
+    {
+        var configBuilder = new ConfigurationBuilder()
+            .SetBasePath(AppContext.BaseDirectory)
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+            .AddEnvironmentVariables();
+
+        var tempConfig = configBuilder.Build();
+        var tempSettings = new AppSettings();
+        tempConfig.GetSection("AppSettings").Bind(tempSettings);
+
+        if (!string.IsNullOrWhiteSpace(tempSettings.ChromeUserDataPath))
+            return tempSettings.ChromeUserDataPath;
+
+        Console.WriteLine();
+        var selectedPath = ChromeProfileFinder.PromptForProfile();
+        if (selectedPath is not null)
+        {
+            ChromeProfileFinder.SaveProfileToSettings(selectedPath);
+        }
+        return selectedPath;
     }
 }
