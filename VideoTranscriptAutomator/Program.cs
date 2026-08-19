@@ -2,9 +2,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Polly;
-using Polly.Retry;
-using Polly.Timeout;
+using System.Diagnostics;
 using VideoTranscriptAutomator.Config;
 using VideoTranscriptAutomator.Helpers;
 using VideoTranscriptAutomator.Interfaces;
@@ -16,14 +14,6 @@ public class Program
 {
     public static async Task Main(string[] args)
     {
-        if (args.Contains("--list-profiles"))
-        {
-            ChromeProfileFinder.ListProfiles();
-            return;
-        }
-
-        var selectedChromePath = ResolveChromeProfile();
-
         var host = Host.CreateDefaultBuilder(args)
             .ConfigureAppConfiguration((context, config) =>
             {
@@ -36,47 +26,9 @@ public class Program
             {
                 services.Configure<AppSettings>(context.Configuration.GetSection("AppSettings"));
 
-                services.PostConfigure<AppSettings>(options =>
-                {
-                    var llmApiKey = Environment.GetEnvironmentVariable("LLM_API_KEY");
-                    if (!string.IsNullOrEmpty(llmApiKey))
-                        options.ApiKey = llmApiKey;
-
-                    if (!string.IsNullOrWhiteSpace(selectedChromePath))
-                        options.ChromeUserDataPath = selectedChromePath;
-                });
-
-                services.AddSingleton<ResiliencePipeline>(sp =>
-                {
-                    var logger = sp.GetRequiredService<ILogger<Program>>();
-                    return new ResiliencePipelineBuilder()
-                        .AddRetry(new RetryStrategyOptions
-                        {
-                            MaxRetryAttempts = 3,
-                            Delay = TimeSpan.FromSeconds(2),
-                            BackoffType = DelayBackoffType.Exponential,
-                            ShouldHandle = new PredicateBuilder()
-                                .Handle<HttpRequestException>()
-                                .Handle<TimeoutRejectedException>(),
-                            OnRetry = args =>
-                            {
-                                logger.LogWarning(
-                                    "[RETRY] Attempt {Attempt} after {Delay}s (operation: {Operation})",
-                                    args.AttemptNumber + 1,
-                                    args.RetryDelay.TotalSeconds,
-                                    args.Context.OperationKey);
-                                return ValueTask.CompletedTask;
-                            }
-                        })
-                        .Build();
-                });
-
                 services.AddSingleton<IUiAutomationService, PlaywrightAutomationService>();
 
-                services.AddHttpClient<ITranscriptionService, TranscriptionService>(client =>
-                {
-                    client.Timeout = TimeSpan.FromMinutes(10);
-                });
+                services.AddSingleton<ITranscriptionService, WhisperTranscriptionService>();
 
                 services.AddSingleton<IVideoProcessor, VideoProcessor>();
             })
@@ -84,6 +36,8 @@ public class Program
             {
                 logging.ClearProviders();
                 logging.AddConsole();
+                logging.AddProvider(new RollingFileLoggerProvider(
+                    Path.Combine(AppContext.BaseDirectory, "logs")));
                 logging.SetMinimumLevel(LogLevel.Information);
             })
             .UseConsoleLifetime()
@@ -94,9 +48,11 @@ public class Program
 
         var settings = host.Services
             .GetRequiredService<Microsoft.Extensions.Options.IOptions<AppSettings>>().Value;
-        logger.LogInformation("Chrome profile: {Profile}", settings.ChromeUserDataPath);
-        logger.LogInformation("Configured Google Drive folders: {Folders}",
+        logger.LogInformation("Session: {Session}", settings.PlaywrightSessionPath);
+        logger.LogInformation("Google Drive folders: {Folders}",
             string.Join(", ", settings.GoogleDriveFolderIds));
+
+        ValidateDependencies(logger);
 
         var processor = host.Services.GetRequiredService<IVideoProcessor>();
 
@@ -118,26 +74,57 @@ public class Program
         logger.LogInformation("VideoTranscriptAutomator finished.");
     }
 
-    private static string? ResolveChromeProfile()
+    private static void ValidateDependencies(ILogger<Program> logger)
     {
-        var configBuilder = new ConfigurationBuilder()
-            .SetBasePath(AppContext.BaseDirectory)
-            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-            .AddEnvironmentVariables();
+        var missing = new List<string>();
 
-        var tempConfig = configBuilder.Build();
-        var tempSettings = new AppSettings();
-        tempConfig.GetSection("AppSettings").Bind(tempSettings);
+        var ffmpegPath = "C:\\ffmpeg\\bin\\ffmpeg.exe";
+        if (!File.Exists(ffmpegPath))
+            missing.Add("ffmpeg");
 
-        if (!string.IsNullOrWhiteSpace(tempSettings.ChromeUserDataPath))
-            return tempSettings.ChromeUserDataPath;
-
-        Console.WriteLine();
-        var selectedPath = ChromeProfileFinder.PromptForProfile();
-        if (selectedPath is not null)
+        var pythonPaths = new[]
         {
-            ChromeProfileFinder.SaveProfileToSettings(selectedPath);
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Python", "python.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "WindowsApps", "python.exe"),
+            "python"
+        };
+
+        var pythonFound = pythonPaths.Any(p => File.Exists(p) || IsCommandInPath(p));
+        if (!pythonFound)
+            missing.Add("python");
+
+        if (missing.Count > 0)
+        {
+            logger.LogCritical("[SETUP] Missing dependencies: {Missing}", string.Join(", ", missing));
+            logger.LogCritical("[SETUP] Install them and try again.");
+            Environment.Exit(1);
         }
-        return selectedPath;
+
+        logger.LogInformation("[SETUP] Dependencies OK: ffmpeg, python");
+    }
+
+    private static bool IsCommandInPath(string command)
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "cmd",
+                Arguments = $"/c where {command}",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(startInfo);
+            if (process is null || !process.WaitForExit(5000))
+                return false;
+
+            return process.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 }

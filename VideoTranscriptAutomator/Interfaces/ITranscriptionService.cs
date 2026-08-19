@@ -4,5 +4,5 @@ namespace VideoTranscriptAutomator.Interfaces;
 
 public interface ITranscriptionService
 {
-    Task<TranscriptionResult> TranscribeAsync(Stream fileStream, string fileName, CancellationToken cancellationToken = default);
+    Task<TranscriptionResult> TranscribeAsync(byte[] fileBytes, string fileName, CancellationToken cancellationToken = default);
 }

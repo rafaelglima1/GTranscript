@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using VideoTranscriptAutomator.Config;
@@ -36,11 +38,28 @@ public class VideoProcessor : IVideoProcessor
             return;
         }
 
+        using var semaphore = new SemaphoreSlim(_settings.MaxConcurrency, _settings.MaxConcurrency);
+        var tasks = new List<Task>();
+
         foreach (var video in videos)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            await ProcessFileAsync(folderId, video, cancellationToken);
+            await semaphore.WaitAsync(cancellationToken);
+
+            tasks.Add(Task.Run(async () =>
+            {
+                try
+                {
+                    await ProcessFileAsync(folderId, video, cancellationToken);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            }, cancellationToken));
         }
+
+        await Task.WhenAll(tasks);
     }
 
     private async Task ProcessFileAsync(string folderId, DriveFileInfo video, CancellationToken cancellationToken)
@@ -50,30 +69,53 @@ public class VideoProcessor : IVideoProcessor
         var txtExists = await _uiService.FileExistsInFolderAsync(folderId, txtName, cancellationToken);
         if (txtExists)
         {
-            _logger.LogWarning("[SKIPPED] Transcription already exists: {TxtName}", txtName);
+            _logger.LogWarning("[SKIPPED] Transcription already exists on Drive: {TxtName}", txtName);
             return;
         }
 
         _logger.LogInformation("[START] Transcribing: {VideoName}", video.Name);
 
         string? downloadedPath = null;
+        string? audioPath = null;
+        string? txtPath = null;
+        bool uploadSucceeded = false;
+
         try
         {
-            downloadedPath = await _uiService.DownloadFileAsync(folderId, video.Name, cancellationToken);
+            downloadedPath = await _uiService.DownloadFileAsync(video.Id, video.Name, cancellationToken);
+            var videoSize = new FileInfo(downloadedPath).Length;
+            _logger.LogInformation("[FFMPEG] Video downloaded: {Size} bytes", videoSize);
 
-            await using var fileStream = File.OpenRead(downloadedPath);
-            var result = await _transcriptionService.TranscribeAsync(fileStream, video.Name, cancellationToken);
+            if (videoSize < _settings.DownloadMinSizeBytes)
+            {
+                throw new InvalidOperationException($"Downloaded file too small: {videoSize} bytes (min: {_settings.DownloadMinSizeBytes})");
+            }
+
+            audioPath = await ExtractAudioAsync(downloadedPath, cancellationToken);
+            var audioSize = new FileInfo(audioPath).Length;
+            _logger.LogInformation("[FFMPEG] Audio extracted: {Size} bytes ({Ratio}x smaller)",
+                audioSize, videoSize / Math.Max(audioSize, 1));
+
+            var audioBytes = await File.ReadAllBytesAsync(audioPath, cancellationToken);
+            var audioFileName = Path.GetFileName(audioPath);
+            var result = await _transcriptionService.TranscribeAsync(audioBytes, audioFileName, cancellationToken);
 
             if (result.Success)
             {
-                var txtPath = Path.Combine(_settings.DownloadDirectory, txtName);
+                txtPath = Path.Combine(_settings.DownloadDirectory, txtName);
                 await File.WriteAllTextAsync(txtPath, result.Transcription, cancellationToken);
-                _logger.LogInformation("[SUCCESS] Written locally: {TxtPath}", txtPath);
+                _logger.LogInformation("[SUCCESS] Written: {TxtPath}", txtPath);
 
-                await _uiService.UploadFileAsync(folderId, txtPath, cancellationToken);
-                _logger.LogInformation("[SUCCESS] Uploaded to Drive: {TxtName}", txtName);
+                uploadSucceeded = await _uiService.UploadFileAsync(folderId, txtPath, cancellationToken);
 
-                try { File.Delete(txtPath); } catch { /* best effort cleanup */ }
+                if (uploadSucceeded)
+                {
+                    _logger.LogInformation("[SUCCESS] Uploaded to Drive: {TxtName}", txtName);
+                }
+                else
+                {
+                    _logger.LogWarning("[WARN] Upload failed, keeping local file: {TxtPath}", txtPath);
+                }
             }
             else
             {
@@ -90,10 +132,51 @@ public class VideoProcessor : IVideoProcessor
         }
         finally
         {
-            if (downloadedPath is not null)
+            SafeDelete(downloadedPath);
+            SafeDelete(audioPath);
+
+            if (uploadSucceeded)
             {
-                try { File.Delete(downloadedPath); } catch { /* best effort cleanup */ }
+                SafeDelete(txtPath);
             }
         }
+    }
+
+    private static void SafeDelete(string? path)
+    {
+        if (path is not null)
+            try { File.Delete(path); } catch { }
+    }
+
+    private async Task<string> ExtractAudioAsync(string videoPath, CancellationToken cancellationToken)
+    {
+        var audioPath = Path.ChangeExtension(videoPath, ".mp3");
+
+        _logger.LogInformation("[FFMPEG] Extracting audio: {Video} -> {Audio}", Path.GetFileName(videoPath), Path.GetFileName(audioPath));
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "ffmpeg",
+            Arguments = $"-i \"{videoPath}\" -vn -acodec libmp3lame -q:a 4 -y \"{audioPath}\"",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using var process = Process.Start(psi)!;
+        var stderr = await process.StandardError.ReadToEndAsync(cancellationToken);
+        await process.WaitForExitAsync(cancellationToken);
+
+        if (process.ExitCode != 0)
+        {
+            _logger.LogError("[FFMPEG] Error: {Error}", stderr[..Math.Min(500, stderr.Length)]);
+            throw new InvalidOperationException($"FFmpeg failed with exit code {process.ExitCode}");
+        }
+
+        if (!File.Exists(audioPath))
+            throw new InvalidOperationException("FFmpeg did not create the audio file");
+
+        return audioPath;
     }
 }
